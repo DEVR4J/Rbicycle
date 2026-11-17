@@ -1,0 +1,172 @@
+name: Build Android TV APK
+
+# Works if you upload the ZIP itself to the repo, or the extracted folder,
+# or the extracted files at the repo root. It finds project.godot wherever it is.
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: "4.3"
+  GODOT_CHANNEL: "stable"
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Find the project (unzips an uploaded zip if needed)
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          if [ -z "$(find . -name project.godot -not -path './.git/*' | head -1)" ]; then
+            ZIP="$(find . -iname '*.zip' -not -path './.git/*' | head -1)"
+            if [ -z "$ZIP" ]; then
+              echo "::error::No project.godot and no .zip found in the repository. Upload the bicycle-rush.zip file or its extracted contents."
+              exit 1
+            fi
+            echo "Unzipping $ZIP"
+            mkdir -p "$GITHUB_WORKSPACE/_unzipped"
+            unzip -q -o "$ZIP" -d "$GITHUB_WORKSPACE/_unzipped"
+          fi
+          P="$(find . -name project.godot -not -path './.git/*' -not -path '*/android/*' | awk '{ print length, $0 }' | sort -n | head -1 | cut -d' ' -f2-)"
+          if [ -z "$P" ]; then
+            echo "::error::project.godot not found."
+            exit 1
+          fi
+          DIR="$(cd "$(dirname "$P")" && pwd)"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "Project folder: $DIR"
+          ls -la "$DIR"
+          if [ ! -f "$DIR/export_presets.cfg" ]; then
+            echo "::error::export_presets.cfg is missing from the project folder."
+            exit 1
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platform-tools" "build-tools;34.0.0" "platforms;android-34" "cmake;3.10.2.4988404" "ndk;23.2.8568313"
+
+      - name: Download Godot and export templates
+        run: |
+          set -e
+          BASE="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_CHANNEL}"
+          curl -fL --retry 3 -o godot.zip "$BASE/Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_linux.x86_64.zip"
+          curl -fL --retry 3 -o templates.tpz "$BASE/Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_export_templates.tpz"
+          unzip -q godot.zip
+          sudo mv "Godot_v${GODOT_VERSION}-${GODOT_CHANNEL}_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_CHANNEL}"
+          mkdir -p "$TPL"
+          unzip -q templates.tpz -d templates_tmp
+          mv templates_tmp/templates/* "$TPL/"
+          godot --version
+
+      - name: Add a Hindi (Devanagari) font
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y fonts-noto-core
+          F="$(find /usr/share/fonts -iname 'NotoSansDevanagari-Regular.ttf' | head -1)"
+          if [ -z "$F" ]; then
+            F="$(find /usr/share/fonts -iname 'NotoSansDevanagari*.ttf' ! -iname '*UI*' ! -iname '*Display*' | head -1)"
+          fi
+          if [ -z "$F" ]; then
+            echo "::error::No Noto Sans Devanagari font found on the runner."
+            exit 1
+          fi
+          mkdir -p "$PROJECT_DIR/fonts"
+          cp "$F" "$PROJECT_DIR/fonts/hindi.ttf"
+          echo "Using font: $F"
+
+      - name: Configure Godot for Android
+        run: |
+          set -e
+          keytool -genkeypair -v -keystore "$HOME/debug.keystore" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p "$HOME/.config/godot"
+          cat > "$HOME/.config/godot/editor_settings-${GODOT_VERSION}.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/android_sdk_path = "$ANDROID_HOME"
+          export/android/debug_keystore = "$HOME/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+          cat "$HOME/.config/godot/editor_settings-${GODOT_VERSION}.tres"
+
+      - name: Install Android build template and Android TV launcher support
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_CHANNEL}"
+          mkdir -p android/build
+          unzip -q -o "$TPL/android_source.zip" -d android/build
+          echo -n "${GODOT_VERSION}.${GODOT_CHANNEL}" > android/.build_version
+          touch android/build/.gdignore
+
+          # TV launcher banner (320x180), drawn here so the zip does not need to carry it
+          mkdir -p android/build/res/drawable-xhdpi
+          BANNER=0
+          if [ -f android_assets/tv_banner.png ]; then
+            cp android_assets/tv_banner.png android/build/res/drawable-xhdpi/tv_banner.png
+            BANNER=1
+          fi
+          export BANNER
+
+          python3 - <<'PY'
+          import os, re, pathlib
+          p = pathlib.Path("android/build/AndroidManifest.xml")
+          s = p.read_text(encoding="utf-8")
+          if "LEANBACK_LAUNCHER" not in s:
+              s = re.sub(r'(<category\s+android:name="android.intent.category.LAUNCHER"\s*/>)',
+                         r'\1\n                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />',
+                         s, count=1)
+          extra = ""
+          if "android.software.leanback" not in s:
+              extra += '    <uses-feature android:name="android.software.leanback" android:required="false" />\n'
+          if "android.hardware.touchscreen" not in s:
+              extra += '    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />\n'
+          if extra:
+              s = s.replace("<application", extra + "\n    <application", 1)
+          if os.environ.get("BANNER") == "1" and "android:banner" not in s:
+              s = s.replace("<application", '<application android:banner="@drawable/tv_banner"', 1)
+          p.write_text(s, encoding="utf-8")
+          PY
+          grep -q LEANBACK_LAUNCHER android/build/AndroidManifest.xml || { echo "::error::Could not add LEANBACK_LAUNCHER to the manifest"; exit 1; }
+
+      - name: Import project
+        run: |
+          cd "$PROJECT_DIR"
+          godot --headless --path . --import || true
+
+      - name: Export debug APK
+        run: |
+          cd "$PROJECT_DIR"
+          mkdir -p build
+          godot --headless --path . --export-debug "Android TV" build/bicycle-rush.apk
+          ls -la build
+          test -f build/bicycle-rush.apk
+          cp build/bicycle-rush.apk "$GITHUB_WORKSPACE/bicycle-rush.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bicycle-rush-apk
+          path: bicycle-rush.apk
+          if-no-files-found: error
